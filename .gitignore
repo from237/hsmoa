@@ -1,0 +1,11 @@
+# 원본 스냅샷은 용량이 커서 커밋하지 않는다.
+# 대신 Actions 아티팩트로 7일간 보관되므로, 파싱이 깨졌을 때 거기서 받아 확인한다.
+data/raw/
+data/unknown_channels.txt
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.DS_Store
