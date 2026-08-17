@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-08-17T21:01:33+09:00",
-  "method": "json",
+  "checked_at": "2026-08-17T21:17:45+09:00",
+  "method": "none",
   "json_endpoints": [
     "https://api.hsmoa.net/v1/ui-compose/short-cut/home",
     "https://app-stat.hsmoa.com/log/record",
