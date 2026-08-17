@@ -116,14 +116,32 @@ def _norm_key(k: str) -> str:
     return re.sub(r"[^a-z0-9]", "", str(k).lower())
 
 
+# logical 필드별로 "이 문자열이 든 키는 피하라"는 배제 규칙.
+# 예) product_url 과 img_url 둘 다 'url' 을 포함하므로, 상품 URL 을 찾을 땐 이미지 키를 배제한다.
+FIELD_AVOID: dict[str, tuple[str, ...]] = {
+    "url": ("img", "image", "thumb", "photo"),
+    "product_name": ("brand", "cate", "category"),
+}
+
+
 def _match_field(keys_norm: dict[str, str], logical: str) -> str | None:
     """정규화된 키맵에서 logical 필드에 해당하는 원본 키를 찾는다."""
     aliases = FIELD_ALIASES[logical]
+    avoid = FIELD_AVOID.get(logical, ())
+
+    def ok(nk: str) -> bool:
+        return not any(a in nk for a in avoid)
+
     # 1순위: 완전 일치
     for alias in aliases:
-        if alias in keys_norm:
+        if alias in keys_norm and ok(alias):
             return keys_norm[alias]
-    # 2순위: 부분 포함 (예: 'goodsNameKor' -> 'goodsname' 포함)
+    # 2순위: 부분 포함 (예: 'goodsNameKor' -> 'goodsname' 포함), 배제어 제외
+    for alias in aliases:
+        for nk, orig in keys_norm.items():
+            if alias in nk and ok(nk):
+                return orig
+    # 3순위: 배제 규칙까지 풀어서 마지막으로 한 번 더 (아예 못 찾느니 낫다)
     for alias in aliases:
         for nk, orig in keys_norm.items():
             if alias in nk:
@@ -312,6 +330,69 @@ DOM_SCRIPT = r"""
 """
 
 
+# --------------------------------------------------------------------------- #
+# JSON.parse 후킹 (암호화 우회의 핵심)
+# --------------------------------------------------------------------------- #
+# hsmoa 의 편성 API(/api/hsmoa/v3/schedule)는 {results: <AES암호문>, iv: ...} 형태로
+# 응답한다. 페이지는 이걸 브라우저 안에서 복호화한 뒤 JSON.parse 로 객체화한다.
+# 따라서 JSON.parse 를 감싸두면 "복호화된 편성 데이터"를 키 없이 그대로 낚아챌 수 있다.
+# (init script 는 페이지의 어떤 스크립트보다 먼저 실행되므로 놓치지 않는다.)
+#
+# 후킹이 잡은 모든 파싱 결과를 다 넘기면 양이 크므로, 페이지 안에서 1차로
+# "편성 배열처럼 생긴" 것만 골라 담는다.
+JSON_HOOK_SCRIPT = r"""
+(() => {
+  const NAME_HINTS = ['name','title','goods','prod','item','subject'];
+  const orig = JSON.parse;
+  const store = [];
+  window.__hsGrab = store;
+
+  function looksLikeRecords(arr) {
+    if (!Array.isArray(arr) || arr.length < 5) return false;
+    let dictCount = 0, nameHit = 0;
+    const sample = arr.slice(0, 20);
+    for (const it of sample) {
+      if (it && typeof it === 'object' && !Array.isArray(it)) {
+        dictCount++;
+        const keys = Object.keys(it).join(' ').toLowerCase();
+        if (NAME_HINTS.some(h => keys.includes(h))) nameHit++;
+      }
+    }
+    return dictCount >= sample.length * 0.6 && nameHit >= 1;
+  }
+
+  function scan(node, depth) {
+    if (depth > 8 || node == null || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      // node 는 JSON.parse 결과라 순수 데이터 → 참조를 그대로 담아도 안전하다.
+      // (window.__hsGrab 은 page.evaluate 시점에 직렬화되어 파이썬으로 넘어간다.)
+      if (looksLikeRecords(node)) store.push(node);
+      for (let i = 0; i < Math.min(node.length, 6); i++) scan(node[i], depth + 1);
+    } else {
+      for (const k in node) {
+        try { scan(node[k], depth + 1); } catch (e) {}
+      }
+    }
+  }
+
+  let inHook = false;   // 재진입 방지
+  JSON.parse = function (text, reviver) {
+    const result = orig.apply(this, arguments);
+    // 복호화 결과는 대개 긴 문자열이 통째로 파싱된다 → 큰 것만 훑어 비용 절약
+    if (!inHook) {
+      inHook = true;
+      try {
+        if (typeof text === 'string' && text.length > 800 && store.length < 200) {
+          scan(result, 0);
+        }
+      } catch (e) {} finally { inHook = false; }
+    }
+    return result;
+  };
+})();
+"""
+
+
 def parse_dom_blocks(blocks: list[dict]) -> list[RawItem]:
     """DOM 에서 긁은 텍스트 덩어리를 필드로 쪼갠다."""
     items: list[RawItem] = []
@@ -375,6 +456,11 @@ async def crawl_date(air_date: _date, raw_dir: Path, headless: bool = True,
             timezone_id="Asia/Seoul",
             viewport={"width": 1440, "height": 2400},
         )
+        # 헤드리스 티를 줄인다 (일부 사이트가 navigator.webdriver 로 렌더를 바꾼다)
+        await ctx.add_init_script(
+            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined});")
+        # JSON.parse 후킹은 반드시 페이지 스크립트보다 먼저 심어야 한다
+        await ctx.add_init_script(JSON_HOOK_SCRIPT)
         page = await ctx.new_page()
 
         async def on_response(resp):
@@ -418,9 +504,17 @@ async def crawl_date(air_date: _date, raw_dir: Path, headless: bool = True,
 
         html = await page.content()
         dom_blocks = await page.evaluate(DOM_SCRIPT)
+        try:
+            grabbed = await page.evaluate("window.__hsGrab || []")
+        except Exception:                       # noqa: BLE001
+            grabbed = []
 
         await ctx.close()
         await browser.close()
+
+    # 후킹이 잡은 복호화 데이터를 응답 payload 와 같은 형식으로 합친다
+    for i, arr in enumerate(grabbed):
+        payloads.append({"url": f"jsonparse://decrypted/{i}", "json": arr})
 
     # ---- 원본 보존 (파싱이 깨져도 데이터는 남는다) ----
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -430,7 +524,9 @@ async def crawl_date(air_date: _date, raw_dir: Path, headless: bool = True,
         (raw_dir / f"{ymd}.payloads.json").write_text(
             json.dumps(slim, ensure_ascii=False)[:60_000_000], encoding="utf-8")
 
-    # ---- 1순위: JSON ----
+    log.info("응답 %d개 관측 · JSON.parse 후킹 %d건 포착", len(endpoints), len(grabbed))
+
+    # ---- 1순위: JSON (응답 인터셉트 + JSON.parse 후킹) ----
     items, used = extract_from_payloads(payloads)
     method = "json"
 
