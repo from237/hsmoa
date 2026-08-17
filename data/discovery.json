@@ -1,0 +1,18 @@
+{
+  "checked_at": "2026-08-17T21:01:33+09:00",
+  "method": "json",
+  "json_endpoints": [
+    "https://api.hsmoa.net/v1/ui-compose/short-cut/home",
+    "https://app-stat.hsmoa.com/log/record",
+    "https://bo-api.hsmoa.net/hsmoa_manager/hsmoa_web_banner",
+    "https://chat-user.buzzni.com/user/v1/device/login",
+    "https://config.airbridge.io/v1/web/apps/hsmoa",
+    "https://event.airbridge.io/v3/apps/hsmoa",
+    "https://hsmoa.com/api/hsmoa/v3/schedule",
+    "https://hsmoa.com/api/user",
+    "https://nam.veta.naver.com/nac/2",
+    "https://o549522.ingest.sentry.io/api/4505027809574912/envelope/",
+    "https://www.oksoon.ai/api/shopping-gpt/v1/conversations",
+    "https://www.oksoon.ai/api/shopping-gpt/v1/question/reco"
+  ]
+}
