@@ -62,8 +62,18 @@ FIELD_ALIASES: dict[str, tuple[str, ...]] = {
 REQUIRED_SIGNALS = ("product_name",)
 SCORING_SIGNALS = ("product_name", "price", "start_time", "channel", "brand", "image")
 
+# 편성표로 인정받기 위한 최소 품질 기준.
+# 실전에서 배너/메뉴 구성 JSON(상품명+URL+이미지만 있고 가격·채널이 없는)이
+# 편성표로 오인된 사고가 있었다 — 진짜 편성표에는 가격이나 채널이 반드시 있다.
+MIN_RECORDS = 8            # 하루 편성은 채널당 수십 건. 8건 미만 배열은 배너일 확률이 높다
+MIN_VALUE_FILL = 0.3       # price 또는 channel 값이 표본의 30% 이상 채워져 있어야 한다
+
+ASSET_NAME_RE = re.compile(r"\.(png|jpe?g|gif|webp|svg)\s*$", re.I)
+BLOCKED_URL_HINTS = ("budibase", "placeholder", "/banner")
+
 TIME_RE = re.compile(r"\b([01]?\d|2[0-3])\s*[:시]\s*([0-5]\d)\b")
 PRICE_RE = re.compile(r"[\d,]{3,}\s*원")
+DIGITS_RE = re.compile(r"\d")
 
 
 # --------------------------------------------------------------------------- #
@@ -142,17 +152,50 @@ def _score_records(records: list[dict]) -> tuple[int, dict[str, str]]:
     if not all(sig in mapping for sig in REQUIRED_SIGNALS):
         return 0, {}
 
-    score = sum(3 for sig in SCORING_SIGNALS if sig in mapping)
-    # 값이 실제로 채워져 있는지도 본다 (키만 있고 전부 빈 값이면 감점)
-    filled = 0
-    for rec in sample:
-        val = rec.get(mapping.get("product_name", ""), "")
-        if isinstance(val, str) and val.strip():
-            filled += 1
-    if filled == 0:
+    if len(records) < MIN_RECORDS:
         return 0, {}
+
+    def fill_ratio(logical: str, need_digits: bool = False) -> float:
+        """표본에서 해당 필드에 실제 값이 들어 있는 비율."""
+        key = mapping.get(logical)
+        if not key:
+            return 0.0
+        n = 0
+        for rec in sample:
+            val = rec.get(key)
+            s = str(val).strip() if val is not None else ""
+            if not s or s.lower() in ("none", "null", "0"):
+                continue
+            if need_digits and not DIGITS_RE.search(s):
+                continue
+            n += 1
+        return n / len(sample)
+
+    # 상품명이 대부분 비어 있으면 탈락
+    name_fill = fill_ratio("product_name")
+    if name_fill < 0.5:
+        return 0, {}
+
+    # 상품명이 이미지 파일명("banner2.png")처럼 생긴 비율이 높으면 배너 구성이다
+    name_key = mapping["product_name"]
+    asset_like = sum(
+        1 for rec in sample
+        if ASSET_NAME_RE.search(str(rec.get(name_key, "")).strip())
+    )
+    if asset_like / len(sample) > 0.2:
+        return 0, {}
+
+    # 핵심 게이트: 가격 또는 채널 중 하나는 실제 값으로 채워져 있어야 편성표다.
+    # 배너/메뉴 JSON 은 이름·URL·이미지는 있어도 가격·채널이 없다.
+    price_fill = fill_ratio("price", need_digits=True)
+    channel_fill = fill_ratio("channel")
+    if price_fill < MIN_VALUE_FILL and channel_fill < MIN_VALUE_FILL:
+        return 0, {}
+
+    score = sum(3 for sig in SCORING_SIGNALS if sig in mapping)
     score += min(len(records) // 10, 20)      # 레코드가 많을수록 진짜 편성표일 확률↑
-    score += int(10 * filled / len(sample))
+    score += int(10 * name_fill)
+    score += int(10 * price_fill) + int(5 * channel_fill)
     return score, mapping
 
 
@@ -211,8 +254,14 @@ def extract_from_payloads(payloads: list[dict]) -> tuple[list[RawItem], list[dic
                 if isinstance(val, (dict, list)):
                     val = json.dumps(val, ensure_ascii=False)
                 setattr(item, logical, "" if val is None else str(val).strip())
-            if item.product_name:
-                items.append(item)
+            if not item.product_name:
+                continue
+            # 개별 항목 수준의 마지막 방어선
+            if ASSET_NAME_RE.search(item.product_name):
+                continue
+            if any(h in item.url.lower() for h in BLOCKED_URL_HINTS):
+                continue
+            items.append(item)
 
     return items, used
 
@@ -386,8 +435,10 @@ async def crawl_date(air_date: _date, raw_dir: Path, headless: bool = True,
     method = "json"
 
     # ---- 2순위: DOM ----
-    if len(items) < 5:
-        log.warning("JSON 에서 %d건만 추출 — DOM 폴백으로 전환", len(items))
+    # 하루 편성은 정상적으로 수백 건이다. 30건 미만이면 JSON 추출이 부분 실패했을
+    # 가능성이 높으니 DOM 도 긁어서 더 많은 쪽을 택한다.
+    if len(items) < 30:
+        log.warning("JSON 에서 %d건만 추출 — DOM 폴백 비교", len(items))
         dom_items = parse_dom_blocks(dom_blocks)
         if len(dom_items) > len(items):
             items, method = dom_items, "dom"
